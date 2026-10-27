@@ -1,25 +1,7 @@
-/**********************************************************************
- * Task-Based Weather Monitoring Station
- * Platform : ESP-IDF 6.1 / ESP32
- * Sensors  : DHT11, LDR, Rain Sensor, BMP280
- * Output   : SSD1306 OLED + UART logging
- *
- * Synchronisation:
- *   xDataMutex     protects shared weather data
- *   xDataReadySem  binary semaphore for data-change notification
- *   xI2CMutex      serialises application-level I2C access
- *
- * Features:
- *   - Sensor validity flags
- *   - Stale-reading detection
- *   - Eight-sample ADC averaging
- *   - OLED updates on data notification or timeout
- *   - UART logging with validity information
- **********************************************************************/
-
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -35,27 +17,43 @@
 #include "ssd1306.h"
 #include "config.h"
 
+/* ============================================================
+ * CONFIGURATION
+ * ============================================================ */
+
+/*
+ * 1: normal operation, protect shared data using a mutex.
+ * 0: controlled demonstration mode, disable data mutex protection.
+ *
+ * USE_MUTEX=0 is intentionally unsafe and must only be used
+ * for a controlled demonstration, not normal operation.
+ */
+#ifndef USE_MUTEX
+#define USE_MUTEX                  1
+#endif
+
+#define ADC_SAMPLE_COUNT           8
+#define ADC_SAMPLE_DELAY_MS        2
+#define I2C_MUTEX_TIMEOUT_MS       1000
+#define DATA_MUTEX_WARN_MS         5
+
+#define DHT_STALE_MS               (DHT_INTERVAL_MS * 3)
+#define LDR_STALE_MS               (LDR_INTERVAL_MS * 3)
+#define RAIN_STALE_MS              (RAIN_INTERVAL_MS * 3)
+#define BMP_STALE_MS               (BMP280_INTERVAL_MS * 3)
+
 static const char *TAG = "WEATHER";
 
-/* ==================== CONFIGURATION ==================== */
-
-#define ADC_SAMPLE_COUNT       8
-#define ADC_SAMPLE_DELAY_MS    2
-#define I2C_MUTEX_TIMEOUT_MS   1000
-
-#define DHT_STALE_MS           (DHT_INTERVAL_MS * 3)
-#define LDR_STALE_MS           (LDR_INTERVAL_MS * 3)
-#define RAIN_STALE_MS          (RAIN_INTERVAL_MS * 3)
-#define BMP_STALE_MS           (BMP280_INTERVAL_MS * 3)
-
-/* ==================== SHARED WEATHER DATA ==================== */
+/* ============================================================
+ * SHARED DATA
+ * ============================================================ */
 
 typedef struct {
-    float temperature;       // Celsius
-    float humidity;          // Percentage
-    float lightPercent;      // Scaled ADC percentage
-    float rainPercent;       // Scaled ADC percentage
-    float pressureHpa;       // Hectopascals
+    float temperature;
+    float humidity;
+    float lightPercent;
+    float rainPercent;
+    float pressureHpa;
 
     bool dhtValid;
     bool lightValid;
@@ -72,42 +70,144 @@ typedef struct {
 
 static WeatherData_t g_weather = {0};
 
-/* ==================== SYNCHRONISATION ==================== */
+/*
+ * Even counter = no write in progress.
+ * Odd counter = a write is in progress.
+ *
+ * This is a diagnostic sequence counter, not a replacement
+ * for the mutex. The ordinary fields in g_weather must not be
+ * read concurrently with writes in production code.
+ */
+static atomic_uint g_dataSequence = ATOMIC_VAR_INIT(0);
+
+/* ============================================================
+ * SYNCHRONISATION OBJECTS
+ * ============================================================ */
 
 static SemaphoreHandle_t xDataMutex = NULL;
 static SemaphoreHandle_t xDataReadySem = NULL;
 static SemaphoreHandle_t xI2CMutex = NULL;
 
-/* ==================== HARDWARE HANDLES ==================== */
+/* Mutex statistics */
+static atomic_uint g_dataLockContentions = ATOMIC_VAR_INIT(0);
+static atomic_uint g_dataLockSlowWaits = ATOMIC_VAR_INIT(0);
+static atomic_uint g_dataLockMaxWaitTicks = ATOMIC_VAR_INIT(0);
+
+/* ============================================================
+ * HARDWARE HANDLES
+ * ============================================================ */
 
 static i2c_master_bus_handle_t i2c_bus = NULL;
 static bmp280_handle_t bmp280_dev = NULL;
 static ssd1306_handle_t oled_dev = NULL;
-
 static adc_oneshot_unit_handle_t adc_handle = NULL;
 
-/* ==================== DATA HELPERS ==================== */
+/* ============================================================
+ * DATA MUTEX AND DIAGNOSTICS
+ * ============================================================ */
 
+static void update_max_wait(TickType_t elapsed)
+{
+    unsigned int previous = atomic_load(
+        &g_dataLockMaxWaitTicks
+    );
+
+    while (elapsed > previous) {
+        if (atomic_compare_exchange_weak(
+                &g_dataLockMaxWaitTicks,
+                &previous,
+                (unsigned int)elapsed)) {
+            break;
+        }
+    }
+}
+
+static void data_lock(const char *taskName)
+{
+#if USE_MUTEX
+    TickType_t start = xTaskGetTickCount();
+
+    /*
+     * This is a blocking wait. For a simple contention metric,
+     * try first, then block if the mutex is occupied.
+     */
+    if (xSemaphoreTake(xDataMutex, 0) != pdTRUE) {
+        atomic_fetch_add(&g_dataLockContentions, 1);
+
+        xSemaphoreTake(xDataMutex, portMAX_DELAY);
+    }
+
+    TickType_t elapsed = xTaskGetTickCount() - start;
+
+    update_max_wait(elapsed);
+
+    if (elapsed >= pdMS_TO_TICKS(DATA_MUTEX_WARN_MS)) {
+        atomic_fetch_add(&g_dataLockSlowWaits, 1);
+
+        ESP_LOGW(TAG,
+                 "%s waited %lu ticks for data mutex",
+                 taskName,
+                 (unsigned long)elapsed);
+    }
+#else
+    (void)taskName;
+#endif
+}
+
+static void data_unlock(void)
+{
+#if USE_MUTEX
+    xSemaphoreGive(xDataMutex);
+#endif
+}
+
+/* ============================================================
+ * SEQUENCE COUNTER
+ * ============================================================ */
+
+static void begin_data_write(void)
+{
+    /*
+     * Writers must be serialised when USE_MUTEX=1.
+     * The counter becomes odd while a write is in progress.
+     */
+    atomic_fetch_add_explicit(
+        &g_dataSequence,
+        1,
+        memory_order_relaxed
+    );
+}
+
+static void end_data_write(void)
+{
+    atomic_fetch_add_explicit(
+        &g_dataSequence,
+        1,
+        memory_order_release
+    );
+}
+
+/*
+ * Call while holding the data mutex in normal operation.
+ * Each complete logical update should have one begin/end pair.
+ */
 static void publish_new_data(void)
 {
     if (xDataReadySem != NULL) {
         /*
-         * Binary semaphore semantics:
-         * multiple gives can coalesce into one pending notification.
-         * This signals that data changed, not how many updates occurred.
+         * Binary semaphore notifications can coalesce.
+         * It signals that data changed, not the number of updates.
          */
         xSemaphoreGive(xDataReadySem);
     }
 }
 
+/* ============================================================
+ * STALE READING HANDLING
+ * ============================================================ */
+
 static void invalidate_stale_readings_locked(TickType_t now)
 {
-    /*
-     * Call only while xDataMutex is held.
-     * Keep the last numerical values for diagnostics, but mark them
-     * invalid when they become too old.
-     */
-
     if (g_weather.dhtValid &&
         (TickType_t)(now - g_weather.dhtLastSuccess) >
         pdMS_TO_TICKS(DHT_STALE_MS)) {
@@ -133,24 +233,60 @@ static void invalidate_stale_readings_locked(TickType_t now)
     }
 }
 
-static void get_validated_snapshot(WeatherData_t *out)
+/*
+ * Copy a consistent snapshot.
+ *
+ * With USE_MUTEX=1, the mutex protects both stale-value updates
+ * and the copy. The sequence counter provides a diagnostic value
+ * that can be reported in the UART log.
+ */
+static bool get_validated_snapshot(
+    WeatherData_t *out,
+    unsigned int *sequenceOut,
+    const char *taskName)
 {
     if (out == NULL) {
-        return;
+        return false;
     }
 
-    if (xSemaphoreTake(xDataMutex, portMAX_DELAY) == pdTRUE) {
-        TickType_t now = xTaskGetTickCount();
+    data_lock(taskName);
 
-        invalidate_stale_readings_locked(now);
-        g_weather.timestamp = now;
-        *out = g_weather;
+    TickType_t now = xTaskGetTickCount();
 
-        xSemaphoreGive(xDataMutex);
+    invalidate_stale_readings_locked(now);
+    g_weather.timestamp = now;
+
+    unsigned int before = atomic_load_explicit(
+        &g_dataSequence,
+        memory_order_acquire
+    );
+
+    *out = g_weather;
+
+    unsigned int after = atomic_load_explicit(
+        &g_dataSequence,
+        memory_order_acquire
+    );
+
+    data_unlock();
+
+    if (sequenceOut != NULL) {
+        *sequenceOut = after;
     }
+
+    /*
+     * An even, unchanged sequence indicates no writer overlapped
+     * the snapshot according to this diagnostic counter.
+     *
+     * With USE_MUTEX=0, this check is only diagnostic. Concurrent
+     * access to ordinary C struct fields is still unsafe.
+     */
+    return (before == after) && ((before & 1U) == 0U);
 }
 
-/* ==================== ADC HELPER ==================== */
+/* ============================================================
+ * ADC AVERAGING
+ * ============================================================ */
 
 static esp_err_t read_adc_average(
     adc_channel_t channel,
@@ -183,10 +319,13 @@ static esp_err_t read_adc_average(
     }
 
     *average = sum / ADC_SAMPLE_COUNT;
+
     return ESP_OK;
 }
 
-/* ==================== I2C INITIALISATION ==================== */
+/* ============================================================
+ * I2C INITIALISATION
+ * ============================================================ */
 
 static void init_i2c_bus(void)
 {
@@ -209,7 +348,9 @@ static void init_i2c_bus(void)
              I2C_SCL_GPIO);
 }
 
-/* ==================== BMP280 INITIALISATION ==================== */
+/* ============================================================
+ * BMP280 INITIALISATION
+ * ============================================================ */
 
 static void init_bmp280(void)
 {
@@ -224,18 +365,20 @@ static void init_bmp280(void)
 
     if (ret != ESP_OK || bmp280_dev == NULL) {
         ESP_LOGE(TAG,
-                 "BMP280 initialisation failed: %s",
+                 "BMP280 init failed: %s",
                  esp_err_to_name(ret));
 
         bmp280_dev = NULL;
     } else {
         ESP_LOGI(TAG,
-                 "BMP280 ready at 0x%02X",
+                 "BMP280 initialised at 0x%02X",
                  BMP280_I2C_ADDR);
     }
 }
 
-/* ==================== SSD1306 INITIALISATION ==================== */
+/* ============================================================
+ * SSD1306 INITIALISATION
+ * ============================================================ */
 
 static void init_ssd1306(void)
 {
@@ -252,7 +395,7 @@ static void init_ssd1306(void)
 
     if (ret != ESP_OK || oled_dev == NULL) {
         ESP_LOGE(TAG,
-                 "SSD1306 initialisation failed: %s",
+                 "SSD1306 init failed: %s",
                  esp_err_to_name(ret));
 
         oled_dev = NULL;
@@ -260,17 +403,20 @@ static void init_ssd1306(void)
     }
 
     /*
-     * No tasks are running yet, so no other application task can
-     * access the bus during this initial clear.
+     * The display is initialised before tasks start.
+     * The existing SSD1306 API used by this project has
+     * a four-argument display_text function.
      */
     ssd1306_clear_display(oled_dev, false);
 
     ESP_LOGI(TAG,
-             "SSD1306 ready at 0x%02X",
+             "SSD1306 initialised at 0x%02X",
              SSD1306_I2C_ADDR);
 }
 
-/* ==================== ADC INITIALISATION ==================== */
+/* ============================================================
+ * ADC INITIALISATION
+ * ============================================================ */
 
 static void init_adc(void)
 {
@@ -303,10 +449,12 @@ static void init_adc(void)
         )
     );
 
-    ESP_LOGI(TAG, "ADC oneshot ready");
+    ESP_LOGI(TAG, "ADC initialised");
 }
 
-/* ==================== DHT11 TASK ==================== */
+/* ============================================================
+ * DHT11 TASK
+ * ============================================================ */
 
 static void vDhtTask(void *pv)
 {
@@ -329,22 +477,22 @@ static void vDhtTask(void *pv)
 
         TickType_t now = xTaskGetTickCount();
 
-        if (xSemaphoreTake(
-                xDataMutex,
-                portMAX_DELAY) == pdTRUE) {
+        data_lock("DHT");
+        begin_data_write();
 
-            if (ret == ESP_OK) {
-                g_weather.temperature = temperature;
-                g_weather.humidity = humidity;
-                g_weather.dhtValid = true;
-                g_weather.dhtLastSuccess = now;
-            } else {
-                g_weather.dhtValid = false;
-            }
-
-            g_weather.timestamp = now;
-            xSemaphoreGive(xDataMutex);
+        if (ret == ESP_OK) {
+            g_weather.temperature = temperature;
+            g_weather.humidity = humidity;
+            g_weather.dhtValid = true;
+            g_weather.dhtLastSuccess = now;
+        } else {
+            g_weather.dhtValid = false;
         }
+
+        g_weather.timestamp = now;
+
+        end_data_write();
+        data_unlock();
 
         if (ret == ESP_OK) {
             ESP_LOGI(TAG,
@@ -363,7 +511,9 @@ static void vDhtTask(void *pv)
     }
 }
 
-/* ==================== LDR TASK ==================== */
+/* ============================================================
+ * LDR TASK
+ * ============================================================ */
 
 static void vLdrTask(void *pv)
 {
@@ -383,23 +533,23 @@ static void vLdrTask(void *pv)
 
         TickType_t now = xTaskGetTickCount();
 
-        if (xSemaphoreTake(
-                xDataMutex,
-                portMAX_DELAY) == pdTRUE) {
+        data_lock("LDR");
+        begin_data_write();
 
-            if (ret == ESP_OK) {
-                g_weather.lightPercent =
-                    (raw / 4095.0f) * 100.0f;
+        if (ret == ESP_OK) {
+            g_weather.lightPercent =
+                (raw / 4095.0f) * 100.0f;
 
-                g_weather.lightValid = true;
-                g_weather.lightLastSuccess = now;
-            } else {
-                g_weather.lightValid = false;
-            }
-
-            g_weather.timestamp = now;
-            xSemaphoreGive(xDataMutex);
+            g_weather.lightValid = true;
+            g_weather.lightLastSuccess = now;
+        } else {
+            g_weather.lightValid = false;
         }
+
+        g_weather.timestamp = now;
+
+        end_data_write();
+        data_unlock();
 
         if (ret == ESP_OK) {
             ESP_LOGI(TAG,
@@ -410,7 +560,7 @@ static void vLdrTask(void *pv)
             publish_new_data();
         } else {
             ESP_LOGE(TAG,
-                     "LDR ADC read failed: %s",
+                     "LDR ADC failed: %s",
                      esp_err_to_name(ret));
         }
 
@@ -418,7 +568,9 @@ static void vLdrTask(void *pv)
     }
 }
 
-/* ==================== RAIN SENSOR TASK ==================== */
+/* ============================================================
+ * RAIN SENSOR TASK
+ * ============================================================ */
 
 static void vRainTask(void *pv)
 {
@@ -438,38 +590,38 @@ static void vRainTask(void *pv)
 
         TickType_t now = xTaskGetTickCount();
 
-        if (xSemaphoreTake(
-                xDataMutex,
-                portMAX_DELAY) == pdTRUE) {
+        data_lock("RAIN");
+        begin_data_write();
 
-            if (ret == ESP_OK) {
-                /*
-                 * Assumes lower ADC voltage means wetter conditions.
-                 * Verify this against actual dry and wet readings.
-                 */
-                g_weather.rainPercent =
-                    (1.0f - (raw / 4095.0f)) * 100.0f;
+        if (ret == ESP_OK) {
+            /*
+             * Assumption: lower ADC readings indicate wetter
+             * conditions. Verify this using actual sensor readings.
+             */
+            g_weather.rainPercent =
+                (1.0f - raw / 4095.0f) * 100.0f;
 
-                g_weather.rainValid = true;
-                g_weather.rainLastSuccess = now;
-            } else {
-                g_weather.rainValid = false;
-            }
-
-            g_weather.timestamp = now;
-            xSemaphoreGive(xDataMutex);
+            g_weather.rainValid = true;
+            g_weather.rainLastSuccess = now;
+        } else {
+            g_weather.rainValid = false;
         }
+
+        g_weather.timestamp = now;
+
+        end_data_write();
+        data_unlock();
 
         if (ret == ESP_OK) {
             ESP_LOGI(TAG,
                      "RAIN: ADC=%d, Scaled=%.1f%%",
                      raw,
-                     (1.0f - (raw / 4095.0f)) * 100.0f);
+                     (1.0f - raw / 4095.0f) * 100.0f);
 
             publish_new_data();
         } else {
             ESP_LOGE(TAG,
-                     "Rain ADC read failed: %s",
+                     "Rain ADC failed: %s",
                      esp_err_to_name(ret));
         }
 
@@ -477,7 +629,9 @@ static void vRainTask(void *pv)
     }
 }
 
-/* ==================== BMP280 TASK ==================== */
+/* ============================================================
+ * BMP280 TASK
+ * ============================================================ */
 
 static void vBmp280Task(void *pv)
 {
@@ -515,30 +669,28 @@ static void vBmp280Task(void *pv)
                 xSemaphoreGive(xI2CMutex);
             } else {
                 ESP_LOGW(TAG,
-                         "BMP280 timed out waiting for I2C mutex");
+                         "BMP280 timed out waiting for I2C");
             }
         }
 
         TickType_t now = xTaskGetTickCount();
 
-        if (xSemaphoreTake(
-                xDataMutex,
-                portMAX_DELAY) == pdTRUE) {
+        data_lock("BMP280");
+        begin_data_write();
 
-            if (valid) {
-                /*
-                 * Assumes the driver returns pressure in pascals.
-                 */
-                g_weather.pressureHpa = pressure / 100.0f;
-                g_weather.bmpValid = true;
-                g_weather.bmpLastSuccess = now;
-            } else {
-                g_weather.bmpValid = false;
-            }
-
-            g_weather.timestamp = now;
-            xSemaphoreGive(xDataMutex);
+        if (valid) {
+            /* Driver pressure output is assumed to be in Pa. */
+            g_weather.pressureHpa = pressure / 100.0f;
+            g_weather.bmpValid = true;
+            g_weather.bmpLastSuccess = now;
+        } else {
+            g_weather.bmpValid = false;
         }
+
+        g_weather.timestamp = now;
+
+        end_data_write();
+        data_unlock();
 
         if (valid) {
             ESP_LOGI(TAG,
@@ -553,28 +705,9 @@ static void vBmp280Task(void *pv)
     }
 }
 
-/* ==================== OLED TEXT HELPER ==================== */
-
-static void display_text_checked(
-    uint8_t row,
-    const char *text)
-{
-    esp_err_t ret = ssd1306_display_text(
-        oled_dev,
-        row,
-        text,
-        false
-    );
-
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "OLED text failed on row %u: %s",
-                 (unsigned)row,
-                 esp_err_to_name(ret));
-    }
-}
-
-/* ==================== DISPLAY TASK ==================== */
+/* ============================================================
+ * OLED DISPLAY TASK
+ * ============================================================ */
 
 static void vDisplayTask(void *pv)
 {
@@ -582,11 +715,8 @@ static void vDisplayTask(void *pv)
 
     while (1) {
         /*
-         * Wait for a notification or periodically refresh.
-         * Do not add a second delay after this wait.
-         *
-         * Multiple semaphore gives can coalesce, which is acceptable
-         * because the display needs the latest snapshot, not every event.
+         * Refresh on notification or timeout.
+         * No additional delay is required after this wait.
          */
         (void)xSemaphoreTake(
             xDataReadySem,
@@ -594,7 +724,18 @@ static void vDisplayTask(void *pv)
         );
 
         WeatherData_t snap = {0};
-        get_validated_snapshot(&snap);
+        unsigned int sequence = 0;
+
+        bool consistent = get_validated_snapshot(
+            &snap,
+            &sequence,
+            "DISPLAY"
+        );
+
+        if (!consistent) {
+            ESP_LOGW(TAG,
+                     "DISPLAY: snapshot sequence inconsistent");
+        }
 
         if (oled_dev == NULL) {
             continue;
@@ -604,9 +745,7 @@ static void vDisplayTask(void *pv)
                 xI2CMutex,
                 pdMS_TO_TICKS(I2C_MUTEX_TIMEOUT_MS))
             != pdTRUE) {
-
-            ESP_LOGW(TAG,
-                     "Display timed out waiting for I2C mutex");
+            ESP_LOGW(TAG, "DISPLAY: I2C mutex timeout");
             continue;
         }
 
@@ -614,58 +753,60 @@ static void vDisplayTask(void *pv)
 
         ssd1306_clear_display(oled_dev, false);
 
-        display_text_checked(0, "WEATHER STATION");
+        ssd1306_display_text(
+            oled_dev, 0, "WEATHER STATION", false);
 
         if (snap.dhtValid) {
             snprintf(line, sizeof(line),
-                     "Temp: %.1f C",
-                     snap.temperature);
+                     "Temp: %.1f C", snap.temperature);
         } else {
             snprintf(line, sizeof(line), "Temp: N/A");
         }
-        display_text_checked(1, line);
+        ssd1306_display_text(oled_dev, 1, line, false);
 
         if (snap.dhtValid) {
             snprintf(line, sizeof(line),
-                     "Hum: %.1f %%",
-                     snap.humidity);
+                     "Hum: %.1f %%", snap.humidity);
         } else {
             snprintf(line, sizeof(line), "Hum: N/A");
         }
-        display_text_checked(2, line);
+        ssd1306_display_text(oled_dev, 2, line, false);
 
         if (snap.lightValid) {
             snprintf(line, sizeof(line),
-                     "Light: %.1f %%",
-                     snap.lightPercent);
+                     "Light: %.1f %%", snap.lightPercent);
         } else {
             snprintf(line, sizeof(line), "Light: N/A");
         }
-        display_text_checked(3, line);
+        ssd1306_display_text(oled_dev, 3, line, false);
 
         if (snap.rainValid) {
             snprintf(line, sizeof(line),
-                     "Rain: %.1f %%",
-                     snap.rainPercent);
+                     "Rain: %.1f %%", snap.rainPercent);
         } else {
             snprintf(line, sizeof(line), "Rain: N/A");
         }
-        display_text_checked(4, line);
+        ssd1306_display_text(oled_dev, 4, line, false);
 
         if (snap.bmpValid) {
             snprintf(line, sizeof(line),
-                     "Press: %.1f hPa",
-                     snap.pressureHpa);
+                     "Press: %.1f hPa", snap.pressureHpa);
         } else {
             snprintf(line, sizeof(line), "Press: N/A");
         }
-        display_text_checked(5, line);
+        ssd1306_display_text(oled_dev, 5, line, false);
 
         xSemaphoreGive(xI2CMutex);
+
+        ESP_LOGD(TAG,
+                 "OLED refreshed, sequence=%u",
+                 sequence);
     }
 }
 
-/* ==================== UART LOGGING TASK ==================== */
+/* ============================================================
+ * UART LOGGING TASK
+ * ============================================================ */
 
 static void vLoggingTask(void *pv)
 {
@@ -677,13 +818,20 @@ static void vLoggingTask(void *pv)
 
     while (1) {
         WeatherData_t snap = {0};
-        get_validated_snapshot(&snap);
+        unsigned int sequence = 0;
+
+        bool consistent = get_validated_snapshot(
+            &snap,
+            &sequence,
+            "LOG"
+        );
 
         ESP_LOGI(TAG,
                  "DHT=%s T=%.2fC H=%.2f%% | "
                  "LDR=%s %.1f%% | "
                  "RAIN=%s %.1f%% | "
-                 "BMP280=%s %.2fhPa | tick=%lu",
+                 "BMP=%s %.2fhPa | "
+                 "SEQ=%u CONSISTENT=%s",
                  snap.dhtValid ? "OK" : "INVALID",
                  snap.temperature,
                  snap.humidity,
@@ -693,19 +841,30 @@ static void vLoggingTask(void *pv)
                  snap.rainPercent,
                  snap.bmpValid ? "OK" : "INVALID",
                  snap.pressureHpa,
-                 (unsigned long)snap.timestamp);
+                 sequence,
+                 consistent ? "YES" : "NO");
+
+        ESP_LOGI(TAG,
+                 "MUTEX_STATS: contentions=%u slow_waits=%u "
+                 "max_wait_ticks=%u USE_MUTEX=%d",
+                 atomic_load(&g_dataLockContentions),
+                 atomic_load(&g_dataLockSlowWaits),
+                 atomic_load(&g_dataLockMaxWaitTicks),
+                 USE_MUTEX);
 
         vTaskDelayUntil(&last, period);
     }
 }
 
-/* ==================== APPLICATION ENTRY ==================== */
+/* ============================================================
+ * APPLICATION ENTRY POINT
+ * ============================================================ */
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "Starting weather monitoring station");
+    ESP_LOGI(TAG, "USE_MUTEX=%d", USE_MUTEX);
 
-    /* Create synchronisation objects before starting tasks. */
     xDataMutex = xSemaphoreCreateMutex();
     xDataReadySem = xSemaphoreCreateBinary();
     xI2CMutex = xSemaphoreCreateMutex();
@@ -714,13 +873,11 @@ void app_main(void)
     configASSERT(xDataReadySem != NULL);
     configASSERT(xI2CMutex != NULL);
 
-    /* Initialise hardware. */
     init_i2c_bus();
     init_bmp280();
     init_ssd1306();
     init_adc();
 
-    /* Create sensor and output tasks. */
     BaseType_t result;
 
     result = xTaskCreate(
@@ -744,7 +901,7 @@ void app_main(void)
     configASSERT(result == pdPASS);
 
     result = xTaskCreate(
-        vDisplayTask, "DISP",
+        vDisplayTask, "DISPLAY",
         4096, NULL, PRIO_DISPLAY, NULL);
     configASSERT(result == pdPASS);
 
