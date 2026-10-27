@@ -12,7 +12,7 @@
 #define I2C_PORT_NUM        0
 #define I2C_FREQ_HZ         400000
 
-#define BMP280_I2C_ADDR     0x76            // try 0x77 if needed
+#define BMP280_I2C_ADDR     0x77            // try 0x77 if needed
 #define SSD1306_I2C_ADDR    0x3C
 
 // ---- Sampling intervals (ms) ----
