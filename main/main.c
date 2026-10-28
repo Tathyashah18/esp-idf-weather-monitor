@@ -2,21 +2,18 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdatomic.h>
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-
 #include "driver/i2c_master.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
 #include "esp_err.h"
-
 #include "dht.h"
 #include "bmp280.h"
 #include "ssd1306.h"
 #include "config.h"
-
+// full working
 /* ============================================================
  * CONFIGURATION
  * ============================================================ */
