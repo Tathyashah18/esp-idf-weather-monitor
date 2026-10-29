@@ -1,19 +1,24 @@
+
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <string.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+
 #include "driver/i2c_master.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
 #include "esp_err.h"
+
 #include "dht.h"
 #include "bmp280.h"
 #include "ssd1306.h"
 #include "config.h"
-// full working
+
 /* ============================================================
  * CONFIGURATION
  * ============================================================ */
@@ -26,18 +31,16 @@
 #define ADC_SAMPLE_DELAY_MS    2
 #define I2C_MUTEX_TIMEOUT_MS   1000
 #define DATA_MUTEX_WARN_MS     5
+#define OLED_LINE_COUNT        6
+#define OLED_LINE_WIDTH        16
 
 #define DHT_STALE_MS           (DHT_INTERVAL_MS * 3)
 #define LDR_STALE_MS           (LDR_INTERVAL_MS * 3)
 #define RAIN_STALE_MS          (RAIN_INTERVAL_MS * 3)
 #define BMP_STALE_MS           (BMP280_INTERVAL_MS * 3)
 
-/*
- * Display refresh interval. Set to 2000 in config.h,
- * or change this default if config.h does not define it.
- */
 #ifndef DISPLAY_INTERVAL_MS
-#define DISPLAY_INTERVAL_MS    2000
+#define DISPLAY_INTERVAL_MS    3000
 #endif
 
 static const char *TAG = "WEATHER";
@@ -68,9 +71,7 @@ typedef struct {
 
 static WeatherData_t g_weather = {0};
 
-/* Even = no write in progress, odd = write in progress. */
 static atomic_uint g_dataSequence = ATOMIC_VAR_INIT(0);
-
 static atomic_uint g_dataLockContentions = ATOMIC_VAR_INIT(0);
 static atomic_uint g_dataLockSlowWaits = ATOMIC_VAR_INIT(0);
 static atomic_uint g_dataLockMaxWaitTicks = ATOMIC_VAR_INIT(0);
@@ -93,13 +94,12 @@ static ssd1306_handle_t oled_dev = NULL;
 static adc_oneshot_unit_handle_t adc_handle = NULL;
 
 /* ============================================================
- * MUTEX DIAGNOSTICS
+ * DATA MUTEX DIAGNOSTICS
  * ============================================================ */
 
 static void update_max_wait(TickType_t elapsed)
 {
-    unsigned int previous =
-        atomic_load(&g_dataLockMaxWaitTicks);
+    unsigned int previous = atomic_load(&g_dataLockMaxWaitTicks);
 
     while (elapsed > previous) {
         if (atomic_compare_exchange_weak(
@@ -122,6 +122,7 @@ static void data_lock(const char *task_name)
     }
 
     TickType_t elapsed = xTaskGetTickCount() - start;
+
     update_max_wait(elapsed);
 
     if (elapsed >= pdMS_TO_TICKS(DATA_MUTEX_WARN_MS)) {
@@ -145,7 +146,7 @@ static void data_unlock(void)
 }
 
 /* ============================================================
- * SEQUENCE COUNTER AND DATA NOTIFICATION
+ * DATA SEQUENCE AND NOTIFICATION
  * ============================================================ */
 
 static void begin_data_write(void)
@@ -162,18 +163,13 @@ static void end_data_write(void)
 
 static void publish_new_data(void)
 {
-    /*
-     * Binary semaphore notifications may coalesce.
-     * The OLED now uses a fixed refresh interval and does not
-     * consume this semaphore.
-     */
     if (xDataReadySem != NULL) {
         xSemaphoreGive(xDataReadySem);
     }
 }
 
 /* ============================================================
- * STALE READING HANDLING AND SNAPSHOTS
+ * STALE SENSOR READING HANDLING
  * ============================================================ */
 
 static void invalidate_stale_readings_locked(TickType_t now)
@@ -268,6 +264,7 @@ static esp_err_t read_adc_average(
     }
 
     *average = sum / ADC_SAMPLE_COUNT;
+
     return ESP_OK;
 }
 
@@ -310,6 +307,7 @@ static void init_bmp280(void)
         ESP_LOGE(TAG,
                  "BMP280 init failed: %s",
                  esp_err_to_name(ret));
+
         bmp280_dev = NULL;
     } else {
         ESP_LOGI(TAG,
@@ -336,11 +334,20 @@ static void init_ssd1306(void)
         ESP_LOGE(TAG,
                  "SSD1306 init failed: %s",
                  esp_err_to_name(ret));
+
         oled_dev = NULL;
         return;
     }
 
-    ssd1306_clear_display(oled_dev, false);
+    /* Clear the OLED only once during initialisation. */
+    if (xSemaphoreTake(
+            xI2CMutex,
+            pdMS_TO_TICKS(I2C_MUTEX_TIMEOUT_MS)) == pdTRUE) {
+
+        ssd1306_clear_display(oled_dev, false);
+
+        xSemaphoreGive(xI2CMutex);
+    }
 
     ESP_LOGI(TAG,
              "SSD1306 ready at 0x%02X",
@@ -385,8 +392,7 @@ static void vDhtTask(void *pv)
     (void)pv;
 
     TickType_t last = xTaskGetTickCount();
-    const TickType_t period =
-        pdMS_TO_TICKS(DHT_INTERVAL_MS);
+    const TickType_t period = pdMS_TO_TICKS(DHT_INTERVAL_MS);
 
     while (1) {
         float humidity = 0.0f;
@@ -421,6 +427,7 @@ static void vDhtTask(void *pv)
             ESP_LOGI(TAG,
                      "DHT11: Temp=%.2f C Humidity=%.2f %%",
                      temperature, humidity);
+
             publish_new_data();
         } else {
             ESP_LOGW(TAG,
@@ -441,11 +448,11 @@ static void vLdrTask(void *pv)
     (void)pv;
 
     TickType_t last = xTaskGetTickCount();
-    const TickType_t period =
-        pdMS_TO_TICKS(LDR_INTERVAL_MS);
+    const TickType_t period = pdMS_TO_TICKS(LDR_INTERVAL_MS);
 
     while (1) {
         int raw = 0;
+
         esp_err_t ret = read_adc_average(
             LDR_ADC_CHANNEL, &raw);
 
@@ -473,6 +480,7 @@ static void vLdrTask(void *pv)
             ESP_LOGI(TAG,
                      "LDR: ADC=%d Scaled=%.1f%%",
                      raw, (raw / 4095.0f) * 100.0f);
+
             publish_new_data();
         } else {
             ESP_LOGE(TAG,
@@ -493,11 +501,11 @@ static void vRainTask(void *pv)
     (void)pv;
 
     TickType_t last = xTaskGetTickCount();
-    const TickType_t period =
-        pdMS_TO_TICKS(RAIN_INTERVAL_MS);
+    const TickType_t period = pdMS_TO_TICKS(RAIN_INTERVAL_MS);
 
     while (1) {
         int raw = 0;
+
         esp_err_t ret = read_adc_average(
             RAIN_ADC_CHANNEL, &raw);
 
@@ -507,10 +515,6 @@ static void vRainTask(void *pv)
         begin_data_write();
 
         if (ret == ESP_OK) {
-            /*
-             * Assumes a lower ADC reading means wetter conditions.
-             * Verify this with your actual sensor.
-             */
             g_weather.rainPercent =
                 (1.0f - raw / 4095.0f) * 100.0f;
 
@@ -530,6 +534,7 @@ static void vRainTask(void *pv)
                      "RAIN: ADC=%d Scaled=%.1f%%",
                      raw,
                      (1.0f - raw / 4095.0f) * 100.0f);
+
             publish_new_data();
         } else {
             ESP_LOGE(TAG,
@@ -550,8 +555,7 @@ static void vBmp280Task(void *pv)
     (void)pv;
 
     TickType_t last = xTaskGetTickCount();
-    const TickType_t period =
-        pdMS_TO_TICKS(BMP280_INTERVAL_MS);
+    const TickType_t period = pdMS_TO_TICKS(BMP280_INTERVAL_MS);
 
     while (1) {
         float temperature = 0.0f;
@@ -604,6 +608,7 @@ static void vBmp280Task(void *pv)
             ESP_LOGI(TAG,
                      "BMP280: Temp=%.2f C Pressure=%.2f hPa",
                      temperature, pressure / 100.0f);
+
             publish_new_data();
         }
 
@@ -612,20 +617,52 @@ static void vBmp280Task(void *pv)
 }
 
 /* ============================================================
+ * OLED LINE FORMATTING
+ * ============================================================ */
+
+/*
+ * The display uses 16 characters per row.
+ * Padding prevents old characters from remaining when
+ * a new reading is shorter than the previous reading.
+ */
+
+static void pad_display_line(char *line, size_t size)
+{
+    if (line == NULL || size == 0) {
+        return;
+    }
+
+    size_t length = strlen(line);
+
+    if (length > OLED_LINE_WIDTH) {
+        line[OLED_LINE_WIDTH] = '\0';
+        length = OLED_LINE_WIDTH;
+    }
+
+    while (length < OLED_LINE_WIDTH && length + 1 < size) {
+        line[length++] = ' ';
+    }
+
+    line[length] = '\0';
+}
+
+/* ============================================================
  * OLED DISPLAY TASK
+ * UPDATE ONLY CHANGED ROWS
  * ============================================================ */
 
 static void vDisplayTask(void *pv)
 {
     (void)pv;
 
-    /*
-     * Fixed-rate refresh. Sensor tasks do not trigger immediate
-     * redraws, preventing rapid consecutive display updates.
-     */
     TickType_t last = xTaskGetTickCount();
     const TickType_t period =
         pdMS_TO_TICKS(DISPLAY_INTERVAL_MS);
+
+    char previous_lines[OLED_LINE_COUNT][32] = {{0}};
+    char current_lines[OLED_LINE_COUNT][32] = {{0}};
+
+    bool first_update = true;
 
     while (1) {
         WeatherData_t snap = {0};
@@ -640,68 +677,127 @@ static void vDisplayTask(void *pv)
         }
 
         if (oled_dev != NULL) {
+
+            /* Row 0: Title */
+            snprintf(current_lines[0],
+                     sizeof(current_lines[0]),
+                     "WEATHER STATION");
+
+            /* Row 1: Temperature */
+            if (snap.dhtValid) {
+                snprintf(current_lines[1],
+                         sizeof(current_lines[1]),
+                         "Temp: %.1f C",
+                         snap.temperature);
+            } else {
+                snprintf(current_lines[1],
+                         sizeof(current_lines[1]),
+                         "Temp: N/A");
+            }
+
+            /* Row 2: Humidity */
+            if (snap.dhtValid) {
+                snprintf(current_lines[2],
+                         sizeof(current_lines[2]),
+                         "Hum: %.1f %%",
+                         snap.humidity);
+            } else {
+                snprintf(current_lines[2],
+                         sizeof(current_lines[2]),
+                         "Hum: N/A");
+            }
+
+            /* Row 3: Light intensity */
+            if (snap.lightValid) {
+                snprintf(current_lines[3],
+                         sizeof(current_lines[3]),
+                         "Light: %.1f %%",
+                         snap.lightPercent);
+            } else {
+                snprintf(current_lines[3],
+                         sizeof(current_lines[3]),
+                         "Light: N/A");
+            }
+
+            /* Row 4: Rain level */
+            if (snap.rainValid) {
+                snprintf(current_lines[4],
+                         sizeof(current_lines[4]),
+                         "Rain: %.1f %%",
+                         snap.rainPercent);
+            } else {
+                snprintf(current_lines[4],
+                         sizeof(current_lines[4]),
+                         "Rain: N/A");
+            }
+
+            /* Row 5: Atmospheric pressure */
+            if (snap.bmpValid) {
+                snprintf(current_lines[5],
+                         sizeof(current_lines[5]),
+                         "Press: %.1f hPa",
+                         snap.pressureHpa);
+            } else {
+                snprintf(current_lines[5],
+                         sizeof(current_lines[5]),
+                         "Press: N/A");
+            }
+
+            /* Pad each row to erase trailing old characters. */
+            for (int row = 0; row < OLED_LINE_COUNT; row++) {
+                pad_display_line(
+                    current_lines[row],
+                    sizeof(current_lines[row]));
+            }
+
             if (xSemaphoreTake(
                     xI2CMutex,
                     pdMS_TO_TICKS(I2C_MUTEX_TIMEOUT_MS))
                 == pdTRUE) {
 
-                char line[32];
+                for (int row = 0; row < OLED_LINE_COUNT; row++) {
 
-                /*
-                 * Clear only once per refresh, not once per line.
-                 */
-                ssd1306_clear_display(oled_dev, false);
+                    /*
+                     * Write the row only if its text has changed.
+                     * On startup, write all rows once.
+                     */
+                    if (first_update ||
+                        strcmp(current_lines[row],
+                               previous_lines[row]) != 0) {
 
-                ssd1306_display_text(
-                    oled_dev, 0, "WEATHER STATION", false);
+                        ssd1306_display_text(
+                            oled_dev,
+                            row,
+                            current_lines[row],
+                            false);
 
-                if (snap.dhtValid) {
-                    snprintf(line, sizeof(line),
-                             "Temp: %.1f C", snap.temperature);
-                } else {
-                    snprintf(line, sizeof(line), "Temp: N/A");
+                        memcpy(previous_lines[row],
+                               current_lines[row],
+                               sizeof(previous_lines[row]));
+
+                        previous_lines[row]
+                            [sizeof(previous_lines[row]) - 1] = '\0';
+
+                        ESP_LOGD(TAG,
+                                 "OLED row %d updated: %s",
+                                 row,
+                                 current_lines[row]);
+                    }
                 }
-                ssd1306_display_text(oled_dev, 1, line, false);
 
-                if (snap.dhtValid) {
-                    snprintf(line, sizeof(line),
-                             "Hum: %.1f %%", snap.humidity);
-                } else {
-                    snprintf(line, sizeof(line), "Hum: N/A");
-                }
-                ssd1306_display_text(oled_dev, 2, line, false);
-
-                if (snap.lightValid) {
-                    snprintf(line, sizeof(line),
-                             "Light: %.1f %%", snap.lightPercent);
-                } else {
-                    snprintf(line, sizeof(line), "Light: N/A");
-                }
-                ssd1306_display_text(oled_dev, 3, line, false);
-
-                if (snap.rainValid) {
-                    snprintf(line, sizeof(line),
-                             "Rain: %.1f %%", snap.rainPercent);
-                } else {
-                    snprintf(line, sizeof(line), "Rain: N/A");
-                }
-                ssd1306_display_text(oled_dev, 4, line, false);
-
-                if (snap.bmpValid) {
-                    snprintf(line, sizeof(line),
-                             "Press: %.1f hPa", snap.pressureHpa);
-                } else {
-                    snprintf(line, sizeof(line), "Press: N/A");
-                }
-                ssd1306_display_text(oled_dev, 5, line, false);
+                first_update = false;
 
                 xSemaphoreGive(xI2CMutex);
+
             } else {
-                ESP_LOGW(TAG, "OLED skipped: I2C mutex timeout");
+                ESP_LOGW(TAG,
+                         "OLED skipped: I2C mutex timeout");
             }
         }
 
-        ESP_LOGD(TAG, "OLED refreshed, sequence=%u", sequence);
+        ESP_LOGD(TAG,
+                 "OLED check complete, sequence=%u",
+                 sequence);
 
         vTaskDelayUntil(&last, period);
     }
@@ -716,8 +812,7 @@ static void vLoggingTask(void *pv)
     (void)pv;
 
     TickType_t last = xTaskGetTickCount();
-    const TickType_t period =
-        pdMS_TO_TICKS(LOG_INTERVAL_MS);
+    const TickType_t period = pdMS_TO_TICKS(LOG_INTERVAL_MS);
 
     while (1) {
         WeatherData_t snap = {0};
@@ -764,7 +859,8 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Starting weather monitoring station");
     ESP_LOGI(TAG, "USE_MUTEX=%d", USE_MUTEX);
-    ESP_LOGI(TAG, "OLED refresh interval: %d ms",
+    ESP_LOGI(TAG,
+             "OLED refresh interval: %d ms",
              DISPLAY_INTERVAL_MS);
 
     xDataMutex = xSemaphoreCreateMutex();
@@ -783,33 +879,57 @@ void app_main(void)
     BaseType_t result;
 
     result = xTaskCreate(
-        vDhtTask, "DHT",
-        4096, NULL, PRIO_SENSOR, NULL);
+        vDhtTask,
+        "DHT",
+        4096,
+        NULL,
+        PRIO_SENSOR,
+        NULL);
     configASSERT(result == pdPASS);
 
     result = xTaskCreate(
-        vLdrTask, "LDR",
-        2048, NULL, PRIO_SENSOR, NULL);
+        vLdrTask,
+        "LDR",
+        2048,
+        NULL,
+        PRIO_SENSOR,
+        NULL);
     configASSERT(result == pdPASS);
 
     result = xTaskCreate(
-        vRainTask, "RAIN",
-        2048, NULL, PRIO_SENSOR, NULL);
+        vRainTask,
+        "RAIN",
+        2048,
+        NULL,
+        PRIO_SENSOR,
+        NULL);
     configASSERT(result == pdPASS);
 
     result = xTaskCreate(
-        vBmp280Task, "BMP280",
-        3072, NULL, PRIO_SENSOR, NULL);
+        vBmp280Task,
+        "BMP280",
+        3072,
+        NULL,
+        PRIO_SENSOR,
+        NULL);
     configASSERT(result == pdPASS);
 
     result = xTaskCreate(
-        vDisplayTask, "DISPLAY",
-        4096, NULL, PRIO_DISPLAY, NULL);
+        vDisplayTask,
+        "DISPLAY",
+        4096,
+        NULL,
+        PRIO_DISPLAY,
+        NULL);
     configASSERT(result == pdPASS);
 
     result = xTaskCreate(
-        vLoggingTask, "LOG",
-        4096, NULL, PRIO_LOGGING, NULL);
+        vLoggingTask,
+        "LOG",
+        4096,
+        NULL,
+        PRIO_LOGGING,
+        NULL);
     configASSERT(result == pdPASS);
 
     ESP_LOGI(TAG, "All tasks created successfully");
