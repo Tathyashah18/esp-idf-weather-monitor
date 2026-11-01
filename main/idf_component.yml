@@ -3,3 +3,4 @@ dependencies:
   esp-idf-lib/dht: "^1.0.0"          # Official, well-maintained driver
   k0i05/esp_bmp280: "^1.2.0"
   k0i05/esp_ssd1306: "^1.1.0"
+  espressif/esp_spiffs: "^1.0.0"
